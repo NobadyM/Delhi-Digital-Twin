@@ -26,6 +26,7 @@ export default function App() {
   const [isFallback, setIsFallback] = useState(false);
   const [apiError, setApiError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [lastSyncedAt, setLastSyncedAt] = useState(new Date().toISOString());
 
   // UI state
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -49,6 +50,7 @@ export default function App() {
       setIsFallback(res.isFallback);
       setApiError(res.error);
       setLastUpdated(res.liveData?.measurement_timestamp || new Date().toISOString());
+      setLastSyncedAt(new Date().toISOString());
     } catch (err) {
       console.error("Telemetry load exception:", err);
       setApiError("Unexpected telemetry failure");
@@ -142,6 +144,7 @@ export default function App() {
       {/* Top Application Navigation */}
       <Header
         lastUpdated={lastUpdated}
+        lastSyncedAt={lastSyncedAt}
         loading={refreshing}
         isFallback={isFallback}
         onRefresh={() => loadTelemetry(true)}

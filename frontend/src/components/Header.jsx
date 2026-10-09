@@ -11,6 +11,7 @@ import {
 
 export default function Header({
   lastUpdated,
+  lastSyncedAt,
   loading,
   isFallback,
   onRefresh,
@@ -19,14 +20,22 @@ export default function Header({
   searchQuery,
   onSearchChange,
 }) {
-  const formattedTime = lastUpdated
+  const formattedObsTime = lastUpdated
     ? new Date(lastUpdated).toLocaleTimeString("en-IN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+      })
+    : "Syncing...";
+
+  const formattedSyncTime = lastSyncedAt
+    ? new Date(lastSyncedAt).toLocaleTimeString("en-IN", {
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
         hour12: true,
       })
-    : "Syncing...";
+    : null;
 
   return (
     <header className="header-nav">
@@ -87,9 +96,17 @@ export default function Header({
         </div>
 
         {/* Timestamp */}
-        <div className="telemetry-time-badge font-mono">
+        <div
+          className="telemetry-time-badge font-mono"
+          title={`Observation window: ${formattedObsTime} IST | Connected to backend: ${formattedSyncTime || "Active"}`}
+        >
           <Clock className="w-3.5 h-3.5 text-slate-400" />
-          <span>{formattedTime}</span>
+          <span className="text-white font-medium">{formattedObsTime}</span>
+          {formattedSyncTime && (
+            <span className="text-xs text-emerald-400 font-sans tracking-normal font-medium ml-1">
+              • LIVE SYNC {formattedSyncTime}
+            </span>
+          )}
         </div>
 
         {/* Action: Refresh Data */}

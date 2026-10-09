@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from statistics import mean
 from typing import Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,6 +10,15 @@ from app.ml.manager import model_manager
 from app.services.ingestion import DELHI_LOCATIONS
 
 router = APIRouter(tags=["Legacy & Compatibility"])
+
+
+def format_utc_iso(dt) -> str:
+    """Formats a datetime object to standard ISO-8601 UTC string with 'Z' suffix."""
+    if not dt:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @router.get("/")
@@ -52,7 +62,9 @@ def get_live_data(db: Session = Depends(get_db)):
             detail="No telemetry observations available. Background ingestion pending.",
         )
 
-    ts_str = obs.observation_timestamp.isoformat() if obs.observation_timestamp else None
+    ts_str = format_utc_iso(obs.observation_timestamp)
+    ingestion_str = format_utc_iso(obs.ingestion_timestamp)
+    current_utc_str = format_utc_iso(datetime.now(timezone.utc))
 
     return {
         "status": "success",
@@ -67,6 +79,8 @@ def get_live_data(db: Session = Depends(get_db)):
         "aqi_status": obs.aqi_status,
         "pollutants": obs.to_pollutants_dict(),
         "measurement_timestamp": ts_str,
+        "ingestion_timestamp": ingestion_str,
+        "server_time": current_utc_str,
         "prediction": obs.prediction,
         "anomaly": obs.anomaly_status,
         "anomaly_status": obs.anomaly_status,
@@ -95,7 +109,7 @@ def get_map_data(db: Session = Depends(get_db)):
         )
 
         if obs:
-            ts_str = obs.observation_timestamp.isoformat() if obs.observation_timestamp else None
+            ts_str = format_utc_iso(obs.observation_timestamp)
             location_results.append({
                 "name": obs.station_name,
                 "latitude": obs.latitude,
