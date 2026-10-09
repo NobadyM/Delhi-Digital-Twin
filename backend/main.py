@@ -1,21 +1,23 @@
-from fastapi import FastAPI
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import pandas as pd
 import requests
-
+from pathlib import Path
+from statistics import mean
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
-MODEL_PATH = "model/isolation_forest.pkl"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "model" / "isolation_forest.pkl"
 
 OPEN_METEO_URL = (
     "https://air-quality-api.open-meteo.com/v1/air-quality"
 )
-
 
 # =========================================================
 # LOAD MACHINE LEARNING MODEL
@@ -23,35 +25,36 @@ OPEN_METEO_URL = (
 
 model = joblib.load(MODEL_PATH)
 
-
 # =========================================================
 # FASTAPI APPLICATION
 # =========================================================
 
 app = FastAPI(
     title="Delhi Digital Twin API",
-    description="Real-Time Urban Air Quality Monitoring and Anomaly Detection",
-    version="1.0"
+    description=(
+        "Real-Time Urban Air Quality Monitoring "
+        "and Anomaly Detection"
+    ),
+    version="2.0"
 )
 
-
-# =========================================================
-# CORS CONFIGURATION
-# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://127.0.0.1:5173",
         "http://localhost:5174",
-        "http://127.0.0.1:5174"
+        "http://localhost:5175",
+        "http://localhost:5176",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://127.0.0.1:5175",
+        "http://127.0.0.1:5176",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # =========================================================
 # INPUT MODEL FOR MANUAL PREDICTION
@@ -67,280 +70,260 @@ class AirQualityData(BaseModel):
 
 
 # =========================================================
-# HELPER: CALCULATE RECENT AVERAGE
+# DELHI MONITORING LOCATIONS
 # =========================================================
 
-def latest_average(values, hours):
-    valid_values = [
-        float(value)
-        for value in values[-hours:]
-        if value is not None
-    ]
-
-    if not valid_values:
-        return None
-
-    return sum(valid_values) / len(valid_values)
-
+DELHI_LOCATIONS = [
+    {
+        "name": "Central Delhi",
+        "latitude": 28.6139,
+        "longitude": 77.2090,
+    },
+    {
+        "name": "North Delhi",
+        "latitude": 28.7041,
+        "longitude": 77.1025,
+    },
+    {
+        "name": "South Delhi",
+        "latitude": 28.5244,
+        "longitude": 77.1855,
+    },
+    {
+        "name": "East Delhi",
+        "latitude": 28.6280,
+        "longitude": 77.2770,
+    },
+    {
+        "name": "West Delhi",
+        "latitude": 28.6517,
+        "longitude": 77.0855,
+    },
+    {
+        "name": "North-East Delhi",
+        "latitude": 28.6800,
+        "longitude": 77.2800,
+    },
+    {
+        "name": "North-West Delhi",
+        "latitude": 28.7200,
+        "longitude": 77.0500,
+    },
+    {
+        "name": "South-East Delhi",
+        "latitude": 28.5600,
+        "longitude": 77.3000,
+    },
+    {
+        "name": "South-West Delhi",
+        "latitude": 28.5700,
+        "longitude": 77.0500,
+    },
+]
 
 # =========================================================
-# ADAPTIVE ANOMALY DETECTION
+# OPEN-METEO REQUEST PARAMETERS
 # =========================================================
 
-def adaptive_anomaly_detection(scores):
+POLLUTANT_FIELDS = [
+    "pm2_5",
+    "pm10",
+    "nitrogen_dioxide",
+    "sulphur_dioxide",
+    "carbon_monoxide",
+    "ozone",
+]
+
+CURRENT_FIELDS = ["us_aqi"] + POLLUTANT_FIELDS
+
+
+def fetch_air_quality(latitudes, longitudes):
     """
-    Detect anomalies relative to the current Delhi
-    live-data distribution.
+    Fetch current US AQI and pollutant concentrations.
 
-    Isolation Forest produces lower scores for more
-    unusual observations.
-
-    A location is considered anomalous when its score
-    is more than one standard deviation below the
-    current Delhi mean score.
+    Open-Meteo returns a list of response objects when
+    multiple coordinates are supplied.
     """
 
-    if not scores:
-        return []
+    params = {
+        "latitude": ",".join(map(str, latitudes)),
+        "longitude": ",".join(map(str, longitudes)),
+        "current": ",".join(CURRENT_FIELDS),
+        "timezone": "Asia/Kolkata",
+    }
 
-    scores_series = pd.Series(scores)
+    try:
+        response = requests.get(
+            OPEN_METEO_URL,
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
 
-    mean_score = scores_series.mean()
-    std_score = scores_series.std(ddof=0)
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Open-Meteo API request failed: {exc}",
+        )
 
-    threshold = mean_score - std_score
+    if isinstance(data, dict) and data.get("error"):
+        raise HTTPException(
+            status_code=502,
+            detail=data.get(
+                "reason",
+                "Open-Meteo returned an API error",
+            ),
+        )
 
-    return [
-        score < threshold
-        for score in scores
-    ]
+    if isinstance(data, dict):
+        data = [data]
 
+    if not isinstance(data, list) or len(data) != len(latitudes):
+        raise HTTPException(
+            status_code=502,
+            detail="Unexpected number of locations in API response",
+        )
 
-# =========================================================
-# AQI SUB-INDEX CALCULATION
-# =========================================================
-
-def calculate_sub_index(concentration, breakpoints):
-
-    if concentration is None:
-        return None
-
-    for bp in breakpoints:
-
-        if bp["low"] <= concentration <= bp["high"]:
-
-            return (
-                (
-                    (bp["aqi_high"] - bp["aqi_low"])
-                    / (bp["high"] - bp["low"])
-                )
-                * (concentration - bp["low"])
-                + bp["aqi_low"]
-            )
-
-    return None
-
-
-# =========================================================
-# AQI CALCULATION FOR ONE OPEN-METEO LOCATION
-# =========================================================
-
-def calculate_location_aqi(location_data):
-
-    hourly = location_data.get("hourly", {})
-
-    hourly_pm25 = hourly.get("pm2_5", [])
-    hourly_pm10 = hourly.get("pm10", [])
-    hourly_no2 = hourly.get("nitrogen_dioxide", [])
-    hourly_so2 = hourly.get("sulphur_dioxide", [])
-    hourly_co = hourly.get("carbon_monoxide", [])
-    hourly_o3 = hourly.get("ozone", [])
-
-
-    # -----------------------------------------------------
-    # Recent averages
-    # -----------------------------------------------------
-
-    avg_pm25 = latest_average(hourly_pm25, 24)
-    avg_pm10 = latest_average(hourly_pm10, 24)
-    avg_no2 = latest_average(hourly_no2, 24)
-    avg_so2 = latest_average(hourly_so2, 24)
-    avg_co = latest_average(hourly_co, 8)
-    avg_o3 = latest_average(hourly_o3, 8)
-
-
-    # -----------------------------------------------------
-    # PM2.5 AQI
-    # -----------------------------------------------------
-
-    pm25_index = calculate_sub_index(
-        avg_pm25,
-        [
-            {"low": 0, "high": 30, "aqi_low": 0, "aqi_high": 50},
-            {"low": 31, "high": 60, "aqi_low": 51, "aqi_high": 100},
-            {"low": 61, "high": 90, "aqi_low": 101, "aqi_high": 200},
-            {"low": 91, "high": 120, "aqi_low": 201, "aqi_high": 300},
-            {"low": 121, "high": 250, "aqi_low": 301, "aqi_high": 400},
-            {"low": 251, "high": 500, "aqi_low": 401, "aqi_high": 500}
-        ]
-    )
-
-
-    # -----------------------------------------------------
-    # PM10 AQI
-    # -----------------------------------------------------
-
-    pm10_index = calculate_sub_index(
-        avg_pm10,
-        [
-            {"low": 0, "high": 50, "aqi_low": 0, "aqi_high": 50},
-            {"low": 51, "high": 100, "aqi_low": 51, "aqi_high": 100},
-            {"low": 101, "high": 250, "aqi_low": 101, "aqi_high": 200},
-            {"low": 251, "high": 350, "aqi_low": 201, "aqi_high": 300},
-            {"low": 351, "high": 430, "aqi_low": 301, "aqi_high": 400},
-            {"low": 431, "high": 500, "aqi_low": 401, "aqi_high": 500}
-        ]
-    )
-
-
-    # -----------------------------------------------------
-    # NO2 AQI
-    # -----------------------------------------------------
-
-    no2_index = calculate_sub_index(
-        avg_no2,
-        [
-            {"low": 0, "high": 40, "aqi_low": 0, "aqi_high": 50},
-            {"low": 41, "high": 80, "aqi_low": 51, "aqi_high": 100},
-            {"low": 81, "high": 180, "aqi_low": 101, "aqi_high": 200},
-            {"low": 181, "high": 280, "aqi_low": 201, "aqi_high": 300},
-            {"low": 281, "high": 400, "aqi_low": 301, "aqi_high": 400},
-            {"low": 401, "high": 800, "aqi_low": 401, "aqi_high": 500}
-        ]
-    )
-
-
-    # -----------------------------------------------------
-    # SO2 AQI
-    # -----------------------------------------------------
-
-    so2_index = calculate_sub_index(
-        avg_so2,
-        [
-            {"low": 0, "high": 40, "aqi_low": 0, "aqi_high": 50},
-            {"low": 41, "high": 80, "aqi_low": 51, "aqi_high": 100},
-            {"low": 81, "high": 380, "aqi_low": 101, "aqi_high": 200},
-            {"low": 381, "high": 800, "aqi_low": 201, "aqi_high": 300},
-            {"low": 801, "high": 1600, "aqi_low": 301, "aqi_high": 400},
-            {"low": 1601, "high": 2620, "aqi_low": 401, "aqi_high": 500}
-        ]
-    )
-
-
-    # -----------------------------------------------------
-    # CO AQI
-    #
-    # Open-Meteo CO is converted from µg/m³ to mg/m³
-    # -----------------------------------------------------
-
-    co_index = calculate_sub_index(
-        avg_co / 1000 if avg_co is not None else None,
-        [
-            {"low": 0, "high": 1.0, "aqi_low": 0, "aqi_high": 50},
-            {"low": 1.1, "high": 2.0, "aqi_low": 51, "aqi_high": 100},
-            {"low": 2.1, "high": 10.0, "aqi_low": 101, "aqi_high": 200},
-            {"low": 10.1, "high": 17.0, "aqi_low": 201, "aqi_high": 300},
-            {"low": 17.1, "high": 34.0, "aqi_low": 301, "aqi_high": 400},
-            {"low": 34.1, "high": 50.0, "aqi_low": 401, "aqi_high": 500}
-        ]
-    )
-
-
-    # -----------------------------------------------------
-    # O3 AQI
-    # -----------------------------------------------------
-
-    o3_index = calculate_sub_index(
-        avg_o3,
-        [
-            {"low": 0, "high": 50, "aqi_low": 0, "aqi_high": 50},
-            {"low": 51, "high": 100, "aqi_low": 51, "aqi_high": 100},
-            {"low": 101, "high": 168, "aqi_low": 101, "aqi_high": 200},
-            {"low": 169, "high": 208, "aqi_low": 201, "aqi_high": 300},
-            {"low": 209, "high": 748, "aqi_low": 301, "aqi_high": 400},
-            {"low": 749, "high": 1000, "aqi_low": 401, "aqi_high": 500}
-        ]
-    )
-
-
-    # -----------------------------------------------------
-    # Final AQI
-    # -----------------------------------------------------
-
-    sub_indices = [
-        index
-        for index in [
-            pm25_index,
-            pm10_index,
-            no2_index,
-            so2_index,
-            co_index,
-            o3_index
-        ]
-        if index is not None
-    ]
-
-    if not sub_indices:
-        return None
-
-    return round(max(sub_indices))
+    return data
 
 
 # =========================================================
-# HELPER: BUILD ML INPUT
+# AQI STATUS - UNITED STATES AQI SCALE
+# =========================================================
+
+def get_aqi_status(aqi):
+    if aqi is None:
+        return "Unknown"
+
+    if aqi <= 50:
+        return "Good"
+    if aqi <= 100:
+        return "Moderate"
+    if aqi <= 150:
+        return "Unhealthy for Sensitive Groups"
+    if aqi <= 200:
+        return "Unhealthy"
+    if aqi <= 300:
+        return "Very Unhealthy"
+
+    return "Hazardous"
+
+
+# =========================================================
+# POLLUTANT RESPONSE FORMAT
+# =========================================================
+
+def extract_pollutants(current):
+    """
+    Open-Meteo pollutant concentrations are in µg/m³.
+    These are current modelled values, not 24-hour averages.
+    """
+
+    field_mapping = {
+        "PM2.5": "pm2_5",
+        "PM10": "pm10",
+        "NO2": "nitrogen_dioxide",
+        "SO2": "sulphur_dioxide",
+        "CO": "carbon_monoxide",
+        "O3": "ozone",
+    }
+
+    pollutants = {}
+
+    for output_name, api_name in field_mapping.items():
+        value = current.get(api_name)
+
+        pollutants[output_name] = (
+            round(float(value), 1)
+            if value is not None
+            else None
+        )
+
+    return pollutants
+
+
+# =========================================================
+# MACHINE LEARNING INPUT
 # =========================================================
 
 def create_ml_input(pollutants):
+    """
+    Preserve the feature order and units expected by the
+    existing Isolation Forest model.
+
+    The original project converts CO from µg/m³ to mg/m³.
+    """
+
+    if any(value is None for value in pollutants.values()):
+        raise ValueError(
+            "Cannot run anomaly detection with missing pollutants"
+        )
 
     return pd.DataFrame([{
         "PM2.5": pollutants["PM2.5"],
         "PM10": pollutants["PM10"],
         "NO2": pollutants["NO2"],
         "SO2": pollutants["SO2"],
-
-        # Open-Meteo CO is µg/m³.
-        # Model training data uses mg/m³.
         "CO": pollutants["CO"] / 1000,
-
-        "O3": pollutants["O3"]
+        "O3": pollutants["O3"],
     }])
 
 
 # =========================================================
-# HELPER: AQI STATUS
+# ISOLATION FOREST PREDICTION
 # =========================================================
 
-def get_aqi_status(aqi):
+def analyse_location(current):
+    """
+    Use the same Isolation Forest decision rule for
+    /api/live and /api/map-data.
 
-    if aqi is None:
-        return "Unknown"
+    -1 = anomaly
+     1 = normal
+    """
 
-    if aqi <= 50:
-        return "Good"
+    pollutants = extract_pollutants(current)
 
-    if aqi <= 100:
-        return "Satisfactory"
+    aqi_value = current.get("us_aqi")
+    aqi = int(round(float(aqi_value))) if aqi_value is not None else None
 
-    if aqi <= 200:
-        return "Moderate"
+    result = {
+        "aqi": aqi,
+        "aqi_status": get_aqi_status(aqi),
+        "pollutants": pollutants,
+        "measurement_timestamp": current.get("time"),
+        "prediction": None,
+        "anomaly": "Unknown",
+        "anomaly_status": "Unknown",
+        "is_anomaly": False,
+        "anomaly_score": None,
+    }
 
-    if aqi <= 300:
-        return "Poor"
+    try:
+        input_data = create_ml_input(pollutants)
 
-    if aqi <= 400:
-        return "Very Poor"
+        prediction = int(model.predict(input_data)[0])
+        score = float(model.decision_function(input_data)[0])
 
-    return "Severe"
+        result.update({
+            "prediction": prediction,
+            "anomaly": (
+                "Anomaly" if prediction == -1 else "Normal"
+            ),
+            "anomaly_status": (
+                "Anomaly" if prediction == -1 else "Normal"
+            ),
+            "is_anomaly": prediction == -1,
+            "anomaly_score": score,
+        })
+
+    except (ValueError, TypeError, KeyError):
+        # Missing or invalid pollutant inputs should not
+        # crash the entire dashboard.
+        pass
+
+    return result
 
 
 # =========================================================
@@ -349,9 +332,9 @@ def get_aqi_status(aqi):
 
 @app.get("/")
 def home():
-
     return {
-        "message": "Delhi Digital Twin API is running"
+        "status": "success",
+        "message": "Delhi Digital Twin API is running",
     }
 
 
@@ -361,196 +344,36 @@ def home():
 
 @app.get("/api/test")
 def test():
-
     return {
         "status": "success",
-        "message": "FastAPI backend is working"
+        "message": "FastAPI backend is working",
     }
 
 
 # =========================================================
-# LIVE DELHI AIR QUALITY ENDPOINT
+# LIVE CENTRAL DELHI DATA
 # =========================================================
 
 @app.get("/api/live")
 def get_live_data():
-
-    params = {
-        "latitude": 28.6139,
-        "longitude": 77.2090,
-
-        "current": (
-            "us_aqi,"
-            "pm2_5,"
-            "pm10,"
-            "nitrogen_dioxide,"
-            "sulphur_dioxide,"
-            "carbon_monoxide,"
-            "ozone"
-        ),
-
-        "hourly": (
-            "pm2_5,"
-            "pm10,"
-            "nitrogen_dioxide,"
-            "sulphur_dioxide,"
-            "carbon_monoxide,"
-            "ozone"
-        ),
-
-        "past_days": 2
-    }
-
-
-    response = requests.get(
-        OPEN_METEO_URL,
-        params=params,
-        timeout=30
+    data = fetch_air_quality(
+        [28.6139],
+        [77.2090],
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    current = data.get("current", {})
-    hourly = data.get("hourly", {})
-
-
-    # -----------------------------------------------------
-    # Calculate pollutant averages
-    # -----------------------------------------------------
-
-    avg_pm25 = latest_average(
-        hourly.get("pm2_5", []),
-        24
-    )
-
-    avg_pm10 = latest_average(
-        hourly.get("pm10", []),
-        24
-    )
-
-    avg_no2 = latest_average(
-        hourly.get("nitrogen_dioxide", []),
-        24
-    )
-
-    avg_so2 = latest_average(
-        hourly.get("sulphur_dioxide", []),
-        24
-    )
-
-    avg_co = latest_average(
-        hourly.get("carbon_monoxide", []),
-        8
-    )
-
-    avg_o3 = latest_average(
-        hourly.get("ozone", []),
-        8
-    )
-
-
-    pollutants = {
-        "PM2.5": round(
-            avg_pm25 if avg_pm25 is not None else 0,
-            1
-        ),
-
-        "PM10": round(
-            avg_pm10 if avg_pm10 is not None else 0,
-            1
-        ),
-
-        "NO2": round(
-            avg_no2 if avg_no2 is not None else 0,
-            1
-        ),
-
-        "SO2": round(
-            avg_so2 if avg_so2 is not None else 0,
-            1
-        ),
-
-        "CO": round(
-            avg_co if avg_co is not None else 0,
-            1
-        ),
-
-        "O3": round(
-            avg_o3 if avg_o3 is not None else 0,
-            1
-        )
-    }
-
-
-    # -----------------------------------------------------
-    # Calculate AQI
-    # -----------------------------------------------------
-
-    aqi = calculate_location_aqi(data)
-
-
-    # -----------------------------------------------------
-    # Isolation Forest score
-    # -----------------------------------------------------
-
-    input_data = create_ml_input(pollutants)
-
-    anomaly_score = float(
-        model.decision_function(input_data)[0]
-    )
-
-    # Keep the original Isolation Forest prediction
-    # available for transparency.
-    model_prediction = int(
-        model.predict(input_data)[0]
-    )
-
-
-    # -----------------------------------------------------
-    # Live endpoint anomaly status
-    #
-    # This endpoint represents Central Delhi only.
-    # The final city-wide adaptive classification is
-    # calculated in /api/map-data.
-    # -----------------------------------------------------
-
-    if model_prediction == -1:
-        anomaly_status = "Anomaly"
-        is_anomaly = True
-    else:
-        anomaly_status = "Normal"
-        is_anomaly = False
-
+    current = data[0].get("current", {})
+    analysis = analyse_location(current)
 
     return {
-
         "status": "success",
-
         "source": "Open-Meteo Air Quality API",
-
+        "aqi_scale": "US AQI",
         "location": {
             "name": "Central Delhi",
             "latitude": 28.6139,
-            "longitude": 77.2090
+            "longitude": 77.2090,
         },
-
-        "aqi": aqi,
-
-        "aqi_status": get_aqi_status(aqi),
-
-        "anomaly": anomaly_status,
-
-        "prediction": model_prediction,
-
-        "is_anomaly": is_anomaly,
-
-        "anomaly_score": anomaly_score,
-
-        "pollutants": pollutants,
-
-        "measurement_timestamp": current.get("time")
+        **analysis,
     }
 
 
@@ -560,465 +383,151 @@ def get_live_data():
 
 @app.post("/api/predict")
 def predict(data: AirQualityData):
+    """
+    Manual input endpoint.
 
-    input_data = pd.DataFrame([{
+    The CO input is assumed to be in µg/m³, consistent
+    with the original dashboard's convention.
+    """
 
+    pollutants = {
         "PM2.5": data.PM2_5,
-
         "PM10": data.PM10,
-
         "NO2": data.NO2,
-
         "SO2": data.SO2,
-
         "CO": data.CO,
+        "O3": data.O3,
+    }
 
-        "O3": data.O3
+    try:
+        input_data = create_ml_input(pollutants)
 
-    }])
+        prediction = int(model.predict(input_data)[0])
+        score = float(model.decision_function(input_data)[0])
 
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid prediction input: {exc}",
+        )
 
-    prediction = model.predict(input_data)[0]
-
-
-    if prediction == -1:
-        status = "Anomaly"
-    else:
-        status = "Normal"
-
+    status = "Anomaly" if prediction == -1 else "Normal"
 
     return {
-
         "status": status,
-
-        "prediction": int(prediction),
-
-        "pollutants": {
-
-            "PM2.5": data.PM2_5,
-
-            "PM10": data.PM10,
-
-            "NO2": data.NO2,
-
-            "SO2": data.SO2,
-
-            "CO": data.CO,
-
-            "O3": data.O3
-
-        }
-
+        "prediction": prediction,
+        "is_anomaly": prediction == -1,
+        "anomaly_score": score,
+        "pollutants": pollutants,
     }
 
 
 # =========================================================
-# MULTIPLE DELHI LOCATIONS
-# =========================================================
-
-DELHI_LOCATIONS = [
-
-    {
-        "name": "Central Delhi",
-        "latitude": 28.6139,
-        "longitude": 77.2090
-    },
-
-    {
-        "name": "North Delhi",
-        "latitude": 28.7041,
-        "longitude": 77.1025
-    },
-
-    {
-        "name": "South Delhi",
-        "latitude": 28.5244,
-        "longitude": 77.1855
-    },
-
-    {
-        "name": "East Delhi",
-        "latitude": 28.6280,
-        "longitude": 77.2770
-    },
-
-    {
-        "name": "West Delhi",
-        "latitude": 28.6517,
-        "longitude": 77.0855
-    },
-
-    {
-        "name": "North-East Delhi",
-        "latitude": 28.6800,
-        "longitude": 77.2800
-    },
-
-    {
-        "name": "North-West Delhi",
-        "latitude": 28.7200,
-        "longitude": 77.0500
-    },
-
-    {
-        "name": "South-East Delhi",
-        "latitude": 28.5600,
-        "longitude": 77.3000
-    },
-
-    {
-        "name": "South-West Delhi",
-        "latitude": 28.5700,
-        "longitude": 77.0500
-    }
-
-]
-
-
-# =========================================================
-# MULTIPLE LOCATION MAP DATA
+# MULTI-LOCATION MAP DATA
 # =========================================================
 
 @app.get("/api/map-data")
 def get_map_data():
+    latitudes = [
+        location["latitude"]
+        for location in DELHI_LOCATIONS
+    ]
 
-    params = {
+    longitudes = [
+        location["longitude"]
+        for location in DELHI_LOCATIONS
+    ]
 
-        "latitude": ",".join(
-            str(location["latitude"])
-            for location in DELHI_LOCATIONS
-        ),
-
-        "longitude": ",".join(
-            str(location["longitude"])
-            for location in DELHI_LOCATIONS
-        ),
-
-        "current": (
-            "pm2_5,"
-            "pm10,"
-            "nitrogen_dioxide,"
-            "sulphur_dioxide,"
-            "carbon_monoxide,"
-            "ozone"
-        ),
-
-        "hourly": (
-            "pm2_5,"
-            "pm10,"
-            "nitrogen_dioxide,"
-            "sulphur_dioxide,"
-            "carbon_monoxide,"
-            "ozone"
-        ),
-
-        "past_days": 2
-    }
-
-
-    response = requests.get(
-        OPEN_METEO_URL,
-        params=params,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    api_data = response.json()
-
-
-    if not isinstance(api_data, list):
-        api_data = [api_data]
-
+    api_data = fetch_air_quality(latitudes, longitudes)
 
     location_results = []
 
-
-    # =====================================================
-    # PROCESS EACH DELHI LOCATION
-    # =====================================================
-
-    for index, location in enumerate(DELHI_LOCATIONS):
-
-        data = api_data[index]
-
+    for location, data in zip(DELHI_LOCATIONS, api_data):
         current = data.get("current", {})
-
-        hourly = data.get("hourly", {})
-
-
-        # -------------------------------------------------
-        # Calculate pollutant averages
-        # -------------------------------------------------
-
-        avg_pm25 = latest_average(
-            hourly.get("pm2_5", []),
-            24
-        )
-
-        avg_pm10 = latest_average(
-            hourly.get("pm10", []),
-            24
-        )
-
-        avg_no2 = latest_average(
-            hourly.get("nitrogen_dioxide", []),
-            24
-        )
-
-        avg_so2 = latest_average(
-            hourly.get("sulphur_dioxide", []),
-            24
-        )
-
-        avg_co = latest_average(
-            hourly.get("carbon_monoxide", []),
-            8
-        )
-
-        avg_o3 = latest_average(
-            hourly.get("ozone", []),
-            8
-        )
-
-
-        pollutants = {
-
-            "PM2.5": round(
-                avg_pm25 if avg_pm25 is not None else 0,
-                1
-            ),
-
-            "PM10": round(
-                avg_pm10 if avg_pm10 is not None else 0,
-                1
-            ),
-
-            "NO2": round(
-                avg_no2 if avg_no2 is not None else 0,
-                1
-            ),
-
-            "SO2": round(
-                avg_so2 if avg_so2 is not None else 0,
-                1
-            ),
-
-            "CO": round(
-                avg_co if avg_co is not None else 0,
-                1
-            ),
-
-            "O3": round(
-                avg_o3 if avg_o3 is not None else 0,
-                1
-            )
-        }
-
-
-        # -------------------------------------------------
-        # Calculate AQI
-        # -------------------------------------------------
-
-        aqi = calculate_location_aqi(data)
-
-
-        # -------------------------------------------------
-        # Isolation Forest score
-        # -------------------------------------------------
-
-        input_data = create_ml_input(pollutants)
-
-        anomaly_score = float(
-            model.decision_function(input_data)[0]
-        )
-
-
-        # -------------------------------------------------
-        # Store initial location result
-        # -------------------------------------------------
+        analysis = analyse_location(current)
 
         location_results.append({
-
             "name": location["name"],
-
             "latitude": location["latitude"],
-
             "longitude": location["longitude"],
-
-            "aqi": aqi,
-
-            "measurement_timestamp": current.get("time"),
-
-            "pollutants": pollutants,
-
-            "anomaly_score": anomaly_score
-
+            **analysis,
         })
 
-
     # =====================================================
-    # ADAPTIVE ANOMALY CLASSIFICATION
-    # =====================================================
-
-    anomaly_scores = [
-
-        location["anomaly_score"]
-
-        for location in location_results
-
-    ]
-
-
-    anomaly_flags = adaptive_anomaly_detection(
-        anomaly_scores
-    )
-
-
-    for location, is_anomaly in zip(
-        location_results,
-        anomaly_flags
-    ):
-
-        location["prediction"] = (
-            -1 if is_anomaly else 1
-        )
-
-        location["anomaly_status"] = (
-
-            "Anomaly"
-            if is_anomaly
-            else "Normal"
-
-        )
-
-        location["is_anomaly"] = bool(
-            is_anomaly
-        )
-
-
-    # =====================================================
-    # CALCULATE AVERAGE AQI
+    # CITY-WIDE MEAN OF AVAILABLE LOCATION AQI VALUES
     # =====================================================
 
     valid_aqi_values = [
-
-        location["aqi"]
-
-        for location in location_results
-
-        if location["aqi"] is not None
-
+        item["aqi"]
+        for item in location_results
+        if item["aqi"] is not None
     ]
 
-
-    if valid_aqi_values:
-
-        average_aqi = (
-
-            sum(valid_aqi_values)
-            / len(valid_aqi_values)
-
-        )
-
-    else:
-
-        average_aqi = 0
-
+    average_aqi = (
+        mean(valid_aqi_values)
+        if valid_aqi_values
+        else None
+    )
 
     # =====================================================
-    # RANK LOCATIONS
+    # RANK LOCATIONS AND IDENTIFY RELATIVE HOTSPOTS
     # =====================================================
 
     ranked_locations = sorted(
-
         location_results,
-
-        key=lambda x: (
-
-            x["aqi"]
-
-            if x["aqi"] is not None
-
-            else 0
-
+        key=lambda item: (
+            item["aqi"]
+            if item["aqi"] is not None
+            else -1
         ),
-
-        reverse=True
-
+        reverse=True,
     )
 
-
-    # =====================================================
-    # HOTSPOT DETECTION
-    #
-    # A relative hotspot is a location whose AQI is
-    # at least 20% higher than the average AQI of
-    # all monitored Delhi locations.
-    # =====================================================
-
-    for rank, location in enumerate(
-        ranked_locations,
-        start=1
-    ):
-
+    for rank, location in enumerate(ranked_locations, start=1):
         location["hotspot_rank"] = rank
 
+        aqi = location["aqi"]
 
-        if (
-            average_aqi > 0
-            and location["aqi"] is not None
-        ):
+        if average_aqi is not None and average_aqi > 0 and aqi is not None:
+            relative_difference = (
+                (aqi - average_aqi) / average_aqi
+            ) * 100
 
             location["relative_to_average_percent"] = round(
-
-                (
-
-                    (
-                        location["aqi"]
-                        - average_aqi
-                    )
-
-                    / average_aqi
-
-                ) * 100,
-
-                1
-
+                relative_difference, 1
             )
 
-
             location["hotspot"] = (
-
-                location["aqi"]
-                >= average_aqi * 1.20
-
+                aqi >= average_aqi * 1.20
             )
 
         else:
-
-            location[
-                "relative_to_average_percent"
-            ] = 0
-
+            location["relative_to_average_percent"] = None
             location["hotspot"] = False
 
+    anomaly_count = sum(
+        1
+        for item in location_results
+        if item["is_anomaly"]
+    )
 
-    # =====================================================
-    # FINAL RESPONSE
-    # =====================================================
+    hotspot_count = sum(
+        1
+        for item in location_results
+        if item["hotspot"]
+    )
 
     return {
-
         "status": "success",
-
         "source": "Open-Meteo Air Quality API",
-
-        "average_aqi": round(
-            average_aqi,
-            1
+        "aqi_scale": "US AQI",
+        "average_aqi": (
+            round(average_aqi, 1)
+            if average_aqi is not None
+            else None
         ),
-
-        "locations": location_results
-
+        "monitored_locations": len(location_results),
+        "anomalies_detected": anomaly_count,
+        "hotspots_detected": hotspot_count,
+        "locations": location_results,
     }

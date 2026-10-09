@@ -86,7 +86,7 @@ function App() {
          --------------------------------------------------- */
 
       const liveResponse = await fetch(
-        "http://127.0.0.1:8000/api/live"
+        "http://127.0.0.1:8001/api/live"
       );
 
       if (!liveResponse.ok) {
@@ -111,7 +111,7 @@ function App() {
          --------------------------------------------------- */
 
       const mapResponse = await fetch(
-        "http://127.0.0.1:8000/api/map-data"
+        "http://127.0.0.1:8001/api/map-data"
       );
 
       if (!mapResponse.ok) {
