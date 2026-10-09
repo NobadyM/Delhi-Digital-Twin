@@ -1,0 +1,23 @@
+# Virtual environments
+venv/
+.venv/
+env/
+backend/venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Node & Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# System & IDE
+.DS_Store
+.idea/
+.vscode/
+*.log
